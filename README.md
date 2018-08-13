@@ -1,7 +1,7 @@
 rainmeter-python
 ================
 
-Originally created by [jblume](https://github.com/jblume), now maintained by [glitchassassin](https://github.com/glitchassassin)
+Originally created by [jblume](https://github.com/jblume), ~~now~~ then maintained by [glitchassassin](https://github.com/glitchassassin), now abandoned.
 
 Plugin for Rainmeter enabling Python 3.4/3.5 scripting
 
