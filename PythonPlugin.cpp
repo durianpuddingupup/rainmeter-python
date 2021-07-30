@@ -44,7 +44,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		Py_SetPythonHome((wchar_t*) pythonHome);
 	}
 	Py_Initialize();
-	PyEval_InitThreads();
+	//PyEval_InitThreads();
 	mainThreadState = PyThreadState_Get();
 	Measure *measure = new Measure;
 	*data = measure;
