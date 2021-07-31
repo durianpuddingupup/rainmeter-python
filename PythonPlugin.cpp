@@ -18,43 +18,67 @@
 
 #include <Windows.h>
 #include <Python.h>
-#include "./rainmeter-plugin-sdk/API/RainmeterAPI.h"
+#include <string>
+#include "RainmeterAPI.h"
 
 PyObject* CreateRainmeterObject(void *rm);
+struct Measure;
 
 PyThreadState *mainThreadState = NULL;
 
-struct Measure
+void RedirectStdErr()
 {
-	Measure()
+	try
 	{
-		measureObject = NULL;
-		getStringResult = NULL;
+		PyObject* iomodule = PyImport_ImportModule("io");
+		if (iomodule == NULL) throw L"Cannot import `io`";
+		PyObject* stringIOClass = PyObject_GetAttrString(iomodule, "StringIO");
+		Py_DECREF(iomodule);
+		if (stringIOClass == NULL) throw L"Cannot get `io.StringIO`";
+		PyObject* stringIO = PyObject_CallNoArgs(stringIOClass);
+		Py_DECREF(stringIOClass);
+		if (stringIO == NULL) throw L"Cannot create a `io.StringIO` object";
+		int result = PySys_SetObject("stderr", stringIO);
+		Py_DECREF(stringIO);
+		if (result == -1) throw L"Cannot set `sys.stderr`";
 	}
+	catch (wchar_t* error)
+	{
+		PyErr_Clear();
+		RmLog(LOG_ERROR, (std::wstring(L"Error redirecting `sys.stderr`: ") + error).c_str());
+	}
+}
 
-	PyObject *measureObject;
-	wchar_t *getStringResult;
-};
-
-PLUGIN_EXPORT void Initialize(void** data, void* rm)
+void LogPythonError()
 {
-	LPCWSTR pythonHome = RmReadString(rm, L"PythonHome", NULL, FALSE);
-	if (pythonHome != NULL)
+	try
 	{
-		Py_SetPythonHome((wchar_t*) pythonHome);
+		if (PyErr_Occurred() == NULL) return;
+		PyErr_Print();
+		PyObject* stdErr = PySys_GetObject("stderr"); // `PySys_GetObject` Return value: Borrowed reference.
+		if (stdErr == NULL) throw L"Cannot get `sys.stderr`";
+		PyObject* getvalue = PyObject_GetAttrString(stdErr, "getvalue");
+		if (getvalue == NULL) throw L"Cannot get `getvalue`";
+		PyObject* value = PyObject_CallNoArgs(getvalue);
+		Py_DECREF(getvalue);
+		if (value == NULL) throw L"Cannot get exception string";
+		wchar_t* str = PyUnicode_AsWideCharString(value, NULL);
+		Py_DECREF(value);
+		RmLog(LOG_ERROR, str);
+		PyMem_Free((void*)str);
+		RedirectStdErr();
 	}
-	Py_Initialize();
-	//PyEval_InitThreads();
-	mainThreadState = PyThreadState_Get();
-	Measure *measure = new Measure;
-	*data = measure;
-	PyEval_SaveThread();
+	catch (wchar_t* error)
+	{
+		PyErr_Clear();
+		RmLog(LOG_ERROR, (std::wstring(L"Error logging an error in python scripts: ") + error).c_str());
+	}
 }
 
 void AddDirToPath(LPCWSTR dir)
 {
-	PyObject *pathObj = PySys_GetObject("path");
-	PyObject *scriptDirObj = PyUnicode_FromWideChar(dir, -1);
+	PyObject* pathObj = PySys_GetObject("path");
+	PyObject* scriptDirObj = PyUnicode_FromWideChar(dir, -1);
 	if (!PySequence_Contains(pathObj, scriptDirObj))
 	{
 		PyList_Append(pathObj, scriptDirObj);
@@ -62,56 +86,44 @@ void AddDirToPath(LPCWSTR dir)
 	Py_DECREF(scriptDirObj);
 }
 
-void LoadScript(LPCWSTR scriptPath, char* fileName, LPCWSTR className, Measure* measure)
+PyObject* LoadScript(LPCWSTR scriptPath, char* fileName, LPCWSTR className)
 {
-	try 
+	try
 	{
 		FILE* f = _Py_wfopen(scriptPath, L"r");
-		if (f == NULL)
-		{
-			throw L"Error opening Python script";
-		}
+		if (f == NULL) throw L"Error opening Python script";
 
-		PyObject *globals = PyModule_GetDict(PyImport_AddModule("__main__"));
-		PyObject *result = PyRun_FileEx(f, fileName, Py_file_input, globals, globals, 1);
-		if (result == NULL)
-		{
-			throw L"Error loading Python script";
-		}
+		PyObject* globals = PyModule_GetDict(PyImport_AddModule("__main__"));
 
+		PyObject* result = PyRun_FileEx(f, fileName, Py_file_input, globals, globals, 1);
+		if (result == NULL) throw;
 		Py_DECREF(result);
-		PyObject *classNameObj = PyUnicode_FromWideChar(className, -1);
-		PyObject *classObj = PyDict_GetItem(globals, classNameObj);
+
+		PyObject* classNameObj = PyUnicode_FromWideChar(className, -1);
+		if (classNameObj == NULL) throw;
+
+		PyObject* classObj = PyDict_GetItem(globals, classNameObj);
 		Py_DECREF(classNameObj);
-		if (classObj == NULL)
-		{
-			throw L"Python class not found";
-		}
+		if (classObj == NULL) throw;
 
-		PyObject *measureObj = PyObject_CallObject(classObj, NULL);
-		if (measureObj == NULL)
-		{
-			throw L"Error instantiating Python class";
-		}
+		PyObject* measureObj = PyObject_CallNoArgs(classObj);
+		if (measureObj == NULL) throw;
 
-		measure->measureObject = measureObj;
-		measure->getStringResult = NULL;
+		return measureObj;
 	}
-	catch (wchar_t *error)
+	catch (wchar_t* error)
 	{
-		measure->measureObject = NULL;
-		measure->getStringResult = error;
+		if (error != NULL) RmLog(LOG_ERROR, error);
+		LogPythonError();
+		return nullptr;
 	}
 }
 
-PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
+struct Measure
 {
-	Measure *measure = (Measure*) data;
-	PyEval_RestoreThread(mainThreadState);
-
-	if (measure->measureObject == NULL)
+	Measure(void* rm)
 	{
-		LPCWSTR scriptPath = RmReadPath(rm, L"ScriptPath", L"default.py");
+		scriptPath = RmReadPath(rm, L"ScriptPath", L"default.py");
 		wchar_t scriptBaseName[_MAX_FNAME];
 		wchar_t scriptExt[_MAX_EXT];
 		wchar_t scriptDir[_MAX_DIR];
@@ -124,21 +136,62 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		lstrcatW(fileName, scriptExt);
 		char fileNameMb[_MAX_FNAME + 1 + _MAX_EXT];
 		wcstombs_s(NULL, fileNameMb, sizeof(fileNameMb), fileName, sizeof(fileName));
-		LPCWSTR className = RmReadString(rm, L"ClassName", L"Measure", FALSE);
-		LoadScript(scriptPath, fileNameMb, className, measure);
+		className = RmReadString(rm, L"ClassName", L"Measure", FALSE);
+		measureObject = LoadScript(scriptPath, fileNameMb, className);
+	}
+
+	PyObject *measureObject;
+	LPCWSTR scriptPath;
+	LPCWSTR className;
+	~Measure()
+	{
+		Py_XDECREF(measureObject);
+	}
+};
+
+PLUGIN_EXPORT void Initialize(void** data, void* rm)
+{
+	LPCWSTR pythonHome = RmReadString(rm, L"PythonHome", NULL, FALSE);
+	if (pythonHome != NULL && !wcscmp(pythonHome, L""))
+	{
+		Py_SetPythonHome(pythonHome);
+	}
+	Py_Initialize();
+	RedirectStdErr();
+
+	Measure* measure = new Measure(rm);
+	*data = measure;
+
+	if (measure->measureObject != NULL)
+	{
+		PyObject* rainmeterObject = CreateRainmeterObject(rm);
+		if (PyObject_HasAttrString(measure->measureObject, "Initialize"))
+		{
+			PyObject* resultObj = PyObject_CallMethod(measure->measureObject, "Initialize", "O", rainmeterObject);
+			if (resultObj == NULL) LogPythonError(); else Py_DECREF(resultObj);
+		}
+		Py_DECREF(rainmeterObject);
+	}
+	mainThreadState = PyEval_SaveThread();
+}
+
+PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
+{
+	Measure *measure = (Measure*) data;
+	PyEval_RestoreThread(mainThreadState);
+
+	if (RmReadInt(rm, L"DynamicVariables", 0))
+	{
+		// TODO
 	}
 
 	if (measure->measureObject != NULL)
 	{
 		PyObject *rainmeterObject = CreateRainmeterObject(rm);
-		PyObject *resultObj = PyObject_CallMethod(measure->measureObject, "Reload", "Od", rainmeterObject, maxValue);
-		if (resultObj != NULL)
+		if (PyObject_HasAttrString(measure->measureObject, "Reload"))
 		{
-			Py_DECREF(resultObj);
-		}
-		else
-		{
-			PyErr_Clear();
+			PyObject* resultObj = PyObject_CallMethod(measure->measureObject, "Reload", "Od", rainmeterObject, maxValue);
+			if (resultObj == NULL) LogPythonError(); else Py_DECREF(resultObj);
 		}
 		Py_DECREF(rainmeterObject);
 	}
@@ -163,7 +216,7 @@ PLUGIN_EXPORT double Update(void* data)
 	}
 	else
 	{
-		PyErr_Clear();
+		LogPythonError();
 	}
 	PyEval_SaveThread();
 	return result;
@@ -174,32 +227,35 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 	Measure *measure = (Measure*) data;
 	if (measure->measureObject == NULL)
 	{
-		return measure->getStringResult;
+		return nullptr;
 	}
 
 	PyEval_RestoreThread(mainThreadState);
 	PyObject *resultObj = PyObject_CallMethod(measure->measureObject, "GetString", NULL);
-	if (measure->getStringResult != NULL)
-	{
-		PyMem_Free(measure->getStringResult);
-		measure->getStringResult = NULL;
-	}
+	wchar_t* result = nullptr;
 	if (resultObj != NULL)
 	{
 		if (resultObj != Py_None)
 		{
 			PyObject *strObj = PyObject_Str(resultObj);
-			measure->getStringResult = PyUnicode_AsWideCharString(strObj, NULL);
+			wchar_t* _result = PyUnicode_AsWideCharString(strObj, NULL);
+			size_t len = wcslen(_result) + 1;
+			result = (wchar_t*)malloc(sizeof(wchar_t) * len);
+			if (result != NULL)
+				wcscpy_s(result, len, _result);
+			else
+				RmLog(LOG_ERROR, L"Error allocating memory for result string.");
+			PyMem_Free(_result);
 			Py_DECREF(strObj);
 		}
 		Py_DECREF(resultObj);
 	}
 	else
 	{
-		PyErr_Clear();
+		LogPythonError();
 	}
 	PyEval_SaveThread();
-	return measure->getStringResult;
+	return result;
 }
 
 PLUGIN_EXPORT void ExecuteBang(void* data, LPCWSTR args)
@@ -219,7 +275,7 @@ PLUGIN_EXPORT void ExecuteBang(void* data, LPCWSTR args)
 	}
 	else
 	{
-		PyErr_Clear();
+		LogPythonError();
 	}
 	Py_DECREF(argsObj);
 	PyEval_SaveThread();
@@ -238,14 +294,9 @@ PLUGIN_EXPORT void Finalize(void* data)
 		}
 		else
 		{
-			PyErr_Clear();
-		}
-
-		if (measure->getStringResult != NULL)
-		{
-			PyMem_Free(measure->getStringResult);
+			LogPythonError();
 		}
 	}
 	delete measure;
-	//Py_Finalize(); // Testing this without killing the interpreter to reset its status
+	Py_Finalize();
 }
